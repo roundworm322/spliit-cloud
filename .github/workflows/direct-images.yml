@@ -1,0 +1,164 @@
+name: Direct balances images
+run-name: Direct balances images (${{ github.sha }})
+
+# Fork-only workflow. Builds the api and web images from the
+# `direct-balances` branch (upstream release + direct pairwise balances) with
+# the repository's own Dockerfiles and publishes them to this account's GHCR:
+#
+#   ghcr.io/<owner>/spliit-cloud-api:<upstream-tag>-direct, :direct-latest
+#   ghcr.io/<owner>/spliit-cloud-web:<upstream-tag>-direct, :direct-latest
+#
+# <upstream-tag> is read from the UPSTREAM_TAG file (see UPSTREAM_SYNC.md).
+# Nothing is deployed. Use the upstream migrate/worker/mcp images of the same
+# release alongside these.
+on:
+  push:
+    branches: ['direct-balances']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+concurrency:
+  group: direct-images
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    name: Resolve tags
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      owner: ${{ steps.owner.outputs.owner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Read upstream release tag
+        id: tag
+        run: |
+          upstream="$(tr -d '[:space:]' < UPSTREAM_TAG)"
+          if ! [[ "$upstream" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error file=UPSTREAM_TAG::Expected vX.Y.Z, got '${upstream}'"
+            exit 1
+          fi
+          echo "tag=${upstream}-direct" >> "$GITHUB_OUTPUT"
+          echo "Publishing ${upstream}-direct and direct-latest" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve image owner
+        id: owner
+        run: |
+          owner="${{ github.repository_owner }}"
+          echo "owner=${owner,,}" >> "$GITHUB_OUTPUT"
+
+  build-api:
+    name: Build api (${{ matrix.arch }})
+    needs: resolve
+    runs-on: ${{ matrix.arch == 'amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    env:
+      IMAGE: ghcr.io/${{ needs.resolve.outputs.owner }}/spliit-cloud-api
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push api
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          target: api
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            APP_SCOPE=@spliit/api
+          push: true
+          tags: ${{ env.IMAGE }}:${{ needs.resolve.outputs.tag }}-${{ matrix.arch }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=direct-api-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=direct-api-${{ matrix.arch }}
+
+  publish-api:
+    name: Publish api multi-arch manifest
+    needs: [resolve, build-api]
+    runs-on: ubuntu-24.04
+    env:
+      IMAGE: ghcr.io/${{ needs.resolve.outputs.owner }}/spliit-cloud-api
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifests
+        run: |
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${TAG}" \
+            --tag "${IMAGE}:direct-latest" \
+            "${IMAGE}:${TAG}-amd64" \
+            "${IMAGE}:${TAG}-arm64"
+          docker buildx imagetools inspect "${IMAGE}:${TAG}"
+
+  # The web dist/ is architecture-independent (Dockerfile.web compiles on
+  # $BUILDPLATFORM), so one multi-platform build covers both architectures.
+  build-web:
+    name: Build web (multi-arch)
+    needs: resolve
+    runs-on: ubuntu-24.04
+    env:
+      IMAGE: ghcr.io/${{ needs.resolve.outputs.owner }}/spliit-cloud-web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push web
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.web
+          target: web
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ needs.resolve.outputs.tag }}
+            ${{ env.IMAGE }}:direct-latest
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=direct-web
+          cache-to: type=gha,mode=max,scope=direct-web
